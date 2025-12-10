@@ -1,0 +1,7 @@
+[*] Using configuration:
+    Host: 54.242.253.82
+    Port: 4444
+    Generate Files: False
+    Output Dir: /tmp/lorem_ipsum
+
+[+] Attempting to connect to 54.242.253.82:4444...
