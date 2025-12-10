@@ -1,0 +1,215 @@
+#!/bin/bash
+set -eox pipefail
+exec > >(tee /var/log/mde-init.log|logger -t user-data -s 2>/dev/console) 2>&1
+echo "ECS_IMAGE_PULL_BEHAVIOR=default" >> /etc/ecs/ecs.config
+echo "ECS_LOGLEVEL=debug" >> /etc/ecs/ecs.config
+echo "ECS_LOG_OUTPUT_FORMAT=json" >> /etc/ecs/ecs.config
+echo "ECS_POLL_METRICS=false" >> /etc/ecs/ecs.config
+echo "ECS_ENABLE_GPU_SUPPORT=true" >> /etc/ecs/ecs.config
+echo "ECS_CLUSTER=moontide-dev-standard1-large-cluster" >> /etc/ecs/ecs.config
+echo "DNS=10.0.0.2" | tee -a /etc/systemd/resolved.conf
+echo "Domain=~." | tee -a /etc/systemd/resolved.conf
+ln -f -s /run/systemd/resolve/resolv.conf /etc/resolv.conf
+systemctl restart systemd-resolved.service
+touch /var/log/routes-moved
+touch /var/log/mde-move-routes.log
+cat > /usr/local/bin/move-routes.sh << 'EOL'
+#!/bin/bash
+set -e  # Exit on error
+set -u  # Exit on undefined variable
+set -o pipefail  # Exit on pipe failures
+set -o xtrace # Print each command before execution
+
+# This script is populating secondary routing table and sets up `ip rule` to forward devfile packages to it.
+# We are using either an secondary ENI connected to a dedicated secondary VPC providing internet egress (internet VPC) or an ENI
+# connected to customer's private VPC to provide egress from the devfile container. To avoid interference with the primary
+# VPC used for MDE's control plane, we are running the devfile container in bridge network mode, which allows us to select
+# customer (devfile) traffic and forward it to the secondary ENI. Specifically we are using a secondary routing table and a
+# combination of iptable rules to mark packages egressing from the bridge and ip rule to forward marked packages to secondary
+# routing table.
+# Alternatively this setup could be done in base-steps in MoontideController. Although has a higher latency impact, since
+# setup steps itself are slower as well as the initial delay because of base-container startup.
+# Maybe some overhead could be saved by using https://pkg.go.dev/github.com/vishvananda/netlink#section-readme instead of calling
+# cmd `ip link....` within go code.
+# See https://quip-amazon.com/D7juAdtJaMxa/MDE-VPC-Prevent-data-exfiltration-through-VPC-Endpoints-Design#temp:C:ZHAf3ce72b084b340d3bcdf7b64e
+
+createSecondaryRt() {
+    sudo mkdir -p /etc/iproute2
+    sudo touch /etc/iproute2/rt_tables
+    if ! grep -Fxq "${ComputeVPCSecondaryRTID} ${ComputeVPCSecondaryRTName}" /etc/iproute2/rt_tables; then
+        echo "${ComputeVPCSecondaryRTID} ${ComputeVPCSecondaryRTName}" | sudo tee -a /etc/iproute2/rt_tables
+        echo "successfully created ${ComputeVPCSecondaryRTName} with id ${ComputeVPCSecondaryRTID}"
+    else
+        echo "skipping creation, since ${ComputeVPCSecondaryRTName} with id ${ComputeVPCSecondaryRTID} already exists"
+    fi
+}
+
+move_routes_to_secondary_rt() {
+    createSecondaryRt
+
+    local interface=$1
+
+    ip route list dev $interface | while IFS= read -r route; do
+      echo "Adding route '$route' to table '${ComputeVPCSecondaryRTName}'"
+      sudo ip route add table ${ComputeVPCSecondaryRTName} dev $interface $route
+      echo "Deleting route '$route' from default table "
+      sudo ip route del $route
+    done
+
+    echo "All routes moved to secondary route table '${ComputeVPCSecondaryRTName}'"
+}
+
+set_ip_rule() {
+    # Setting ip rule for forwarding marked packages to ${ComputeVPCSecondaryRTName}, since it may get
+    # deleted after a new ENI gets attached  https://github.com/amazonlinux/amazon-ec2-net-utils/issues/96
+    if ! ip rule | grep ${ComputeVPCSecondaryRTName}; then
+        echo "Setting ip rule for forwarding marked packages to ${ComputeVPCSecondaryRTName}"
+        sudo ip rule add fwmark 1 table ${ComputeVPCSecondaryRTName}
+    else
+        echo "Skip setting ip rule for forwarding marked packages to ${ComputeVPCSecondaryRTName} since it already exists"
+    fi
+}
+
+set_rp_filter() {
+    # We need to set rp_filter to option 2 (= loose reverse path filtering)
+    # When a response packet arrives at eth1, the kernel immediately performs reverse path filtering
+    # BEFORE any iptables rules or ip rules are applied. The kernel checks the main routing table
+    # (which shows eth0 as default route) to determine how to reach the packet's destination (devfile container).
+    # Since this differs from the actual receiving interface (eth1), strict mode (rp_filter=1) would
+    # drop these packets. Loose mode (rp_filter=2) allows this asymmetry between the main routing table
+    # and actual packet flow, which is necessary for our routing setup to work.
+    # We need to do it as part of move-routes, to ensure newly attached ENIs are also correctly configured.
+    # https://datatracker.ietf.org/doc/html/rfc3704
+    for i in /proc/sys/net/ipv4/conf/*/rp_filter; do
+        if [ ! -f "$i" ]; then
+            echo "Skipping $i (file not found)"
+            continue
+        fi
+        if current_value=$(cat "$i" 2>/dev/null); then
+            if [ "$current_value" = "1" ]; then
+                echo "Setting $i from $current_value to 2"
+                echo 2 > "$i"
+            else
+                echo "Skipping $i (current value: $current_value)"
+            fi
+        fi
+    done
+}
+
+check_routes() {
+    # creating empty sentinel file so it can be mounted
+    touch /var/log/routes-moved
+    local deviceNumber=$1
+
+    # Wait until the interface is up
+    echo "Wait until interface is up..."
+    altname=$(until ip link list | grep -Eo "device-number-${deviceNumber}\.[0-9]|eth${deviceNumber}"; do sleep 1; done)
+    echo "Interface with ${altname} found."
+    interface=$(ip link list dev $altname | head -1 | cut -d: -f2 | tr -d ' ')
+    echo "Interface has primary name ${interface}"
+    echo "Wait until routes are populated..."
+    until ip route list dev $interface | grep -q .; do sleep 1; done
+    # Add another bit of safety buffer, since it may take a few more milliseconds until all routes are populated
+    sleep 3
+    # Move routes for this interface to secondary routing table
+    move_routes_to_secondary_rt "$interface"
+    # Setting ip rule (ec2-net-utils does clean them on newly added interfaces)
+    set_ip_rule
+    # Setting rp_filter is necessary especially for AL2 images, to allow correcting flow of response packages
+    set_rp_filter
+    # Sentinel file ensures, that we can check success in moontide-controller
+    ip link list dev $interface > /var/log/routes-moved
+    echo "Successfully moved routes for interface ${interface}"
+
+    exit 0
+}
+
+# check and trigger move for interface with altname "device-number-1"
+check_routes 1 & pid1=$!
+# check and trigger move for interface with altname "device-number-2"
+check_routes 2 & pid2=$!
+
+# We wait for both processes to exit, since we only expect each type of interface to get attached once (internet ENI, private VPC ENI)
+wait $pid1 $pid2
+
+exit 0
+
+EOL
+sudo chmod +x /usr/local/bin/move-routes.sh
+cat > /etc/systemd/system/move-routes.service << 'EOL'
+[Unit]
+Description=Move routes to secondary routing table
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/move-routes.sh
+Environment=ComputeVPCSecondaryRTName=secondary_rt
+Environment=ComputeVPCSecondaryRTID=200
+Restart=no
+RestartSec=1
+StandardOutput=append:/var/log/mde-move-routes.log
+StandardError=append:/var/log/mde-move-routes.log
+
+[Install]
+WantedBy=multi-user.target
+EOL
+sudo systemctl enable move-routes.service
+sudo systemctl start move-routes.service
+((until sudo iptables -L DOCKER-USER >/dev/null 2>&1; do sleep 0.1; done && sudo iptables --wait 30 -I DOCKER-USER -j ACCEPT && sudo iptables --wait 30 -t mangle -A PREROUTING -s 172.31.255.192/26 -j MARK --set-mark 1 && sudo iptables --wait 30 -t mangle -A PREROUTING -s 192.168.255.192/26 -j MARK --set-mark 1) || echo "failed setting iptables rule to forward docker bridge traffic") &
+yum_awscli_retries=0
+max_yum_awscli_retries=10
+while [ $yum_awscli_retries -lt $max_yum_awscli_retries ]; do
+    set +e
+    yum install -y awscli
+    yum_awscli_install_exit_status=$?
+    set -e
+    if [ $yum_awscli_install_exit_status -eq 0 ]; then
+        echo "Package awscli installed successfully."
+        break  # Exit the loop if the installation is successful
+    else
+        yum_awscli_retries=$((yum_awscli_retries+1))
+        if [ $yum_awscli_retries -eq $max_yum_awscli_retries ]; then
+            echo "Maximum retry attempts ($max_yum_awscli_retries) reached. Failed to install package awscli."
+            shutdown now -h  # shutdown the instance in case we fail to install awscli so AGS can launch a replacement
+        fi
+        echo "Failed to install package awscli. Retry attempt $yum_awscli_retries/$max_yum_awscli_retries in 1 seconds."
+        sleep 1  # Sleep 1 seconds before next retry
+    fi
+done
+
+function installMDEEC2Agent() {
+sudo aws s3 cp s3://moontide-ec2-artifacts-regional-458783832014/ec2-agent/bin/server /tmp/mde-ec2-agent
+sudo chmod +x /tmp/mde-ec2-agent
+sudo /tmp/mde-ec2-agent --region us-east-1 --botocore-artifacts-uri "s3://moontide-ec2-artifacts-regional-458783832014/ec2-agent/botocore-artifacts.zip" --stage prod &> /var/log/mde-ec2-agent.log
+}
+(( installMDEEC2Agent ) || echo "failed to install MDE EC2 agent" ) &
+        
+
+function installChronicleAgent() {
+    # Capture logs
+    exec > >(tee /var/log/chronicle-init.log|logger -t user-data -s 2>/dev/console) 2>&1
+    # Configure Chronicle NamespaceFiltering
+    # https://w.amazon.com/bin/view/Chronicle/Onboarding/NamespaceFiltering/
+    mkdir -p /etc/chronicle
+    # metadata.json file used to configure customer_account_id for Chronicle agent
+    echo '{}' > /etc/chronicle/metadata.json
+    echo '{"namespace_filters": ["pid"]}' > /etc/chronicle/config.json
+    # Download and install Chronicle
+    aws s3 cp s3://moontide-ec2-artifacts-bucket-792359258118/install_chronicled.py /tmp/chronicle.py
+    python3 /tmp/chronicle.py
+    rm -f /tmp/chronicle.py
+}
+(( installChronicleAgent ) || echo "failed to install Chronicle agent" ) &
+
+(yum remove -y openssh-server && systemctl stop sshd && systemctl disable sshd) || echo "Disabling the OpenSSH Daemon failed. Continuing the user data script."
+((aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 458783832014.dkr.ecr.us-east-1.amazonaws.com && docker pull 458783832014.dkr.ecr.us-east-1.amazonaws.com/mde-consumed-images:live_base_100 && echo "$(date) Consumed base image pulled" && rm ~/.docker/config.json) || ("rm -f ~/.docker/config.json" && echo "$(date) Consumed base image pull failed")) &
+mkdir -p /var/lib/mde-store
+mkdir -p /var/log/sentinel
+((set +x && while [ ! -e /dev/sdx ]; do sleep 0.5; done && set -x && echo "$(date) Checking volume formatted" && blkid /dev/sdx || (echo "$(date) Formatting volume" && mkfs -t ext4 /dev/sdx) && echo "$(date) Mounting volume" && mount /dev/sdx /var/lib/mde-store && echo "success" > /var/lib/mde-store/mounted && echo "success" > /var/log/sentinel/mounted && echo "$(date) Volume mounted") || echo "failed" > /var/log/sentinel/mounted) &
+mkdir -p /var/lib/mde-store-additional-0
+((set +x && while [ ! -e /dev/sdf ]; do sleep 0.5; done && set -x && echo "$(date) Checking additional volume formatted" && blkid /dev/sdf || (echo "$(date) Formatting additional volume" && mkfs -t ext4 /dev/sdf) && echo "$(date) Mounting additional volume" && mount /dev/sdf /var/lib/mde-store-additional-0 && while [ ! -f /var/log/sentinel/mounted ]; do sleep 0.5; done && [ $(</var/log/sentinel/mounted) = "success" ] && echo "success" > /var/lib/mde-store/mde-store-additional-0-mounted && echo "success" > /var/log/sentinel/mde-store-additional-0-mounted && echo "$(date) Additional Volume mounted") || echo "failed" > /var/log/sentinel/mde-store-additional-0-mounted) &
+echo ECS_CLUSTER=moontide-dev-standard1-large-cluster >> /etc/ecs/ecs.config
+sudo iptables --insert FORWARD 1 --in-interface docker+ --destination 169.254.169.254/32 --jump DROP
+sudo service iptables save
+echo ECS_AWSVPC_BLOCK_IMDS=true >> /etc/ecs/ecs.config
